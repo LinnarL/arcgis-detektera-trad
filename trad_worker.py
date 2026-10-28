@@ -41,6 +41,9 @@ Popescu & Wynne 2004; samma princip som lmf() i R-paketet lidR):
    cisterner) eller är ett tunt föremål (låg täckning och få returer:
    ledningar). Anroparen tar bort dem om användaren valt det. Broar (klass
    17) ingår aldrig i CHM:en.
+8. Kronor (om params["crowns"]): markörstyrd vattendelare på den utjämnade
+   CHM:en med topparna som markörer (crown_labels), polygoniserade med GDAL
+   och förenklade (crown_polygons). Skickas som WKB i npz-filen.
 """
 
 import json
@@ -76,6 +79,17 @@ HARD_GROW_M = 1.5
 # längs två ledningar och 2 av 1640 toppar i tät skog.
 THIN_MAX_COVER = 0.3
 THIN_MAX_POINTS = 8
+# Kronor (crown_labels): en cell hör till en krona om den är minst
+# CROWN_MIN_REL av trädets höjd och högst CROWN_MAX_R_FACTOR x höjden från
+# toppen (silva2016 i lidR: exclusion 0,3, max_cr_factor 0,6 som diameter).
+# Ingen cell under CROWN_MIN_H över mark.
+CROWN_MIN_REL = 0.5
+CROWN_MAX_R_FACTOR = 0.3
+CROWN_MIN_H = 2.0
+CROWN_LEVEL_M = 0.25
+# Polygonernas trappsteg (cellkanter) förenklas med denna tolerans i meter.
+CROWN_SIMPLIFY_M = 0.3
+MIN_RING_AREA_M2 = 0.05
 
 # Upplösning (m) för det interna markrutnätet som punkthöjderna räknas från.
 DTM_RES = 0.5
@@ -336,6 +350,140 @@ def hard_surface_mask(chm, fx, fy, fh, fsingle, gx0, gytop, res):
     return hard
 
 
+def crown_labels(sm, hard, tx, ty, th, gx0, gytop, res):
+    """
+    Kronor som etikettraster (0 = ingen krona, j + 1 = toppen j): en
+    vattendelare som fyller den utjämnade CHM:en uppifrån, CROWN_LEVEL_M i
+    taget, från en markör per topp. På varje nivå växer kronorna cell för cell
+    in i celler som nått nivån, så att gränsen mellan två kronor hamnar i
+    sadeln mellan dem. En cell tas bara med om den är minst CROWN_MIN_H över
+    mark, inte hård yta, minst CROWN_MIN_REL av toppens höjd i den utjämnade
+    CHM:en och inom CROWN_MAX_R_FACTOR x trädhöjden från toppen. Villkoren
+    prövas när cellen läggs till, så varje krona hänger ihop med sin topp.
+
+    scipy.ndimage.watershed_ift är ingen vanlig vattendelare: med två toppar
+    fick den högre bara sin egen cell och resten gick till den lägre
+    (uppmätt), och med bakgrundsmarkörer gick en fjärdedel av krontaket till
+    bakgrunden. Därför denna egna fyllning.
+    """
+    h, w = sm.shape
+    labels = np.zeros(h * w, np.int32)
+    if len(tx) == 0:
+        return labels.reshape(h, w)
+    col = np.clip(np.floor((tx - gx0) / res).astype(np.int64), 0, w - 1)
+    row = np.clip(np.floor((gytop - ty) / res).astype(np.int64), 0, h - 1)
+    labels[row * w + col] = np.arange(1, len(tx) + 1, dtype=np.int32)
+    flat = sm.ravel()
+    h_top = flat[row * w + col]
+    min_h = np.concatenate([[0.0], np.maximum(CROWN_MIN_REL * h_top, CROWN_MIN_H)])
+    max_r = np.concatenate([[0.0], CROWN_MAX_R_FACTOR * th + res])
+    ax = np.concatenate([[0.0], tx])
+    ay = np.concatenate([[0.0], ty])
+    eligible = ((sm >= CROWN_MIN_H) & ~hard).ravel()
+    offsets = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+    top = float(flat[eligible].max()) if eligible.any() else CROWN_MIN_H
+    for level in np.arange(top, CROWN_MIN_H - 1e-9, -CROWN_LEVEL_M):
+        # Bara cellerna som väntar på en etikett på den här nivån gås igenom,
+        # inte hela rastret: det gjorde ett block på 1 km² 4 gånger långsammare.
+        free = np.flatnonzero(eligible & (flat >= level) & (labels == 0))
+        while free.size:
+            r, c = np.divmod(free, w)
+            best = np.zeros(free.size, np.int32)
+            for dr, dc in offsets:
+                rr, cc = r + dr, c + dc
+                inb = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w)
+                nb = np.zeros(free.size, np.int32)
+                nb[inb] = labels[rr[inb] * w + cc[inb]]
+                np.maximum(best, nb, out=best)
+            new = best > 0
+            if not new.any():
+                break
+            idx, lab = free[new], best[new]
+            r, c = r[new], c[new]
+            cx = gx0 + (c + 0.5) * res
+            cy = gytop - (r + 0.5) * res
+            ok = (flat[idx] >= min_h[lab]) & (np.hypot(cx - ax[lab], cy - ay[lab]) <= max_r[lab])
+            labels[idx[ok]] = lab[ok]
+            # En cell som inte klarar villkoren för sin granne prövas inte igen.
+            eligible[idx[~ok]] = False
+            free = free[~new]
+    return labels.reshape(h, w)
+
+
+def _ring_area(pts):
+    """Ringens yta med tecken (positiv moturs), skosnöresformeln."""
+    x, y = pts[:, 0], pts[:, 1]
+    return 0.5 * float(np.sum(x[:-1] * y[1:] - x[1:] * y[:-1]))
+
+
+def _ring_wkb(pts, ccw):
+    """En ring som WKB-del, orienterad moturs (ccw) eller medurs."""
+    import struct
+    if (_ring_area(pts) > 0) != ccw:
+        pts = pts[::-1]
+    return struct.pack("<I", len(pts)) + np.ascontiguousarray(pts, "<f8").tobytes()
+
+
+def crown_polygons(labels, keep_idx, gx0, gytop, res):
+    """
+    Polygoner för kronorna till topparna keep_idx (index i etikettrastret).
+    Returnerar (wkb, offs): kronan k är wkb[offs[k]:offs[k + 1]] som WKB
+    MultiPolygon (tom om toppen saknar krona). Ringarna orienteras enligt OGC
+    (yttre moturs, hål medurs); fel orientering lagras annars tyst som negativ
+    yta (se CLAUDE.md).
+    """
+    import struct
+    from osgeo import gdal, ogr
+    gdal.UseExceptions()
+    n = len(keep_idx)
+    lut = np.zeros(int(labels.max()) + 1 if labels.size else 1, np.int32)
+    lut[keep_idx + 1] = np.arange(1, n + 1, dtype=np.int32)
+    out = lut[labels]
+    parts = [[] for _ in range(n)]
+    if out.any():
+        h, w = out.shape
+        ds = gdal.GetDriverByName("MEM").Create("", w, h, 1, gdal.GDT_Int32)
+        ds.SetGeoTransform([gx0, res, 0.0, gytop, 0.0, -res])
+        band = ds.GetRasterBand(1)
+        band.WriteArray(out)
+        vds = gdal.GetDriverByName("MEM").Create("", 0, 0, 0, gdal.GDT_Unknown)
+        lyr = vds.CreateLayer("kronor", geom_type=ogr.wkbPolygon)
+        lyr.CreateField(ogr.FieldDefn("k", ogr.OFTInteger))
+        gdal.Polygonize(band, band, lyr, 0, ["8CONNECTED=8"])
+        for feat in lyr:
+            k = feat.GetField(0) - 1
+            geom = feat.GetGeometryRef().SimplifyPreserveTopology(CROWN_SIMPLIFY_M)
+            if geom is None or geom.IsEmpty():
+                continue
+            polys = [geom] if geom.GetGeometryType() == ogr.wkbPolygon else \
+                [geom.GetGeometryRef(i) for i in range(geom.GetGeometryCount())]
+            for poly in polys:
+                # Förenklingen kan lämna ringar utan yta: en sådan yttre ring
+                # stryker polygonen, ett sådant hål stryks.
+                rings = [np.array(poly.GetGeometryRef(i).GetPoints())[:, :2]
+                         for i in range(poly.GetGeometryCount())]
+                if not rings or len(rings[0]) < 4 or \
+                        abs(_ring_area(rings[0])) < MIN_RING_AREA_M2:
+                    continue
+                holes = [r for r in rings[1:]
+                         if len(r) >= 4 and abs(_ring_area(r)) >= MIN_RING_AREA_M2]
+                parts[k].append([rings[0]] + holes)
+        vds = ds = None
+    chunks, offs = [], [0]
+    for polys in parts:
+        if not polys:
+            offs.append(offs[-1])
+            continue
+        b = struct.pack("<BII", 1, 6, len(polys))
+        for rings in polys:
+            b += struct.pack("<BII", 1, 3, len(rings))
+            b += b"".join(_ring_wkb(r, i == 0) for i, r in enumerate(rings))
+        chunks.append(b)
+        offs.append(offs[-1] + len(b))
+    wkb = np.frombuffer(b"".join(chunks), np.uint8) if chunks else np.zeros(0, np.uint8)
+    return wkb, np.array(offs, np.int64)
+
+
 def top_features(fx, fy, fh, fsingle, tx, ty, th, a, b):
     """
     Mått på ytan runt varje topp, ur förstareturerna inom sökfönstrets radie
@@ -434,9 +582,16 @@ def process_block(pdal, task):
     hard = hard_surface_mask(chm, fx, fy, fh, fsingle, cx0, cytop, cres)
     del chm
     tx, ty, th = find_tops(fx, fy, fh, cx0, cytop, cres, rows, cols, sm)
-    del sm
     keep = ((tx >= blk["x0"]) & (tx < blk["x1"]) & (ty >= blk["y0"]) & (ty < blk["y1"])
             & (th >= prm["hmin"]))
+    crowns = None
+    if prm.get("crowns"):
+        # Alla toppar i läsområdet är markörer, även de i marginalen, så att en
+        # krona i blocket inte breder ut sig över grannträdets.
+        labels = crown_labels(sm, hard, tx, ty, th, cx0, cytop, cres)
+        crowns = crown_polygons(labels, np.nonzero(keep)[0], cx0, cytop, cres)
+        del labels
+    del sm
     tx, ty, th = tx[keep], ty[keep], th[keep]
     tz = sample_bilinear(dtm, dx0, dytop, dres, tx, ty)
     fn, fs, fr, fc = top_features(fx, fy, fh, fsingle, tx, ty, th, prm["a"], prm["b"])
@@ -449,8 +604,9 @@ def process_block(pdal, task):
     result["tops_thin"] = int(thin.sum())
     if len(tx):
         npz = os.path.join(workdir, "tops_{}.npz".format(tag))
+        extra = {"crown_wkb": crowns[0], "crown_offs": crowns[1]} if crowns else {}
         np.savez(npz, x=tx, y=ty, h=th, ground=tz, n=fn, single=fs, rough=fr, cover=fc,
-                 hard=on_hard, thin=thin)
+                 hard=on_hard, thin=thin, **extra)
         result["npz"] = npz
     result["peak_bytes"] = peak_memory_bytes()
     return result

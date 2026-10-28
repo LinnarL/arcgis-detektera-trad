@@ -144,6 +144,9 @@ AOI_POLYGONS = "Polygoner (lager eller ritade i kartan)"
 AOI_EXTENT = "Utbredning (kartvy, lager eller koordinater)"
 AOI_EMPTY = "Rita minst en polygon i kartan eller välj ett polygonlager."
 
+LYRX_TOPS = "tradtoppar.lyrx"
+LYRX_CROWNS = "tradkronor.lyrx"
+
 SRC_STAC = "Lantmäteriets Laserdata Skog (hämtas över nätet)"
 SRC_LOCAL = "Lokala LAS/LAZ-filer"
 
@@ -211,10 +214,21 @@ TOOLTIPS_DETECT = {
         "från lokala filer."
     ),
     "out_features": (
-        "Punktfeatureklassen som skapas, en punkt per trädtopp. Fält: trädhöjd (m över mark), "
+        "Punktfeatureklassen som skapas, en punkt per trädtopp, visad som ett litet rött kors. "
+        "Fält: träd-ID (samma som i kronorna), trädhöjd (m över mark), "
         "markhöjd vid toppen (m ö.h., RH 2000), källfil eller ruta, skanningsområde och "
         "insamlingsperiod. Följer miljöinställningen Skriv över utdata. Koordinatsystemet är "
         "SWEREF 99 TM om inte miljön Utdatakoordinatsystem anger ett annat."
+    ),
+    "out_crowns": (
+        "Valfri polygonfeatureklass med en krona per trädtopp, kopplad till punkten med fältet "
+        "TRAD_ID. Fält: trädhöjd, kronans yta (m²) och diameter (m, cirkel med samma yta). "
+        "Kronorna växer uppifrån i den utjämnade ythöjdmodellen från varje topp tills de möter "
+        "grannens krona, sjunker under halva trädets höjd eller når 0,3 x trädhöjden från "
+        "toppen, och breder aldrig ut sig över byggnader. Hela kronan behålls även där den når "
+        "utanför området. Kronor runt toppar som togs bort som byggnad eller ledning tas också "
+        "bort. Visas med streckad kontur utan fyllning. Töm fältet för att bara få topparna; "
+        "det sparar ungefär en femtedel av tiden."
     ),
     "min_height": (
         "Lägsta trädhöjd i meter över mark. Lägre toppar sparas inte. Under ungefär 2-4 m blir "
@@ -1248,6 +1262,16 @@ def _write_tool_metadata(tool_cls, toolbox_alias, tooltips, summary):
         pass
 
 
+def _set_symbology(parameter, lyrx):
+    """
+    Lagerfil som Pro använder när utdata läggs till i kartan. Saknas filen
+    (t.ex. om bara .pyt kopierats) får lagret Pro:s standardsymbol.
+    """
+    path = os.path.join(_HERE, lyrx)
+    if os.path.isfile(path):
+        parameter.symbology = path
+
+
 def _unique_output(name):
     """Ett ledigt namn i projektets geodatabas, som standardvärde för utdata."""
     gdb = _default_gdb()
@@ -1415,6 +1439,16 @@ class DetekteraTrad:
         default_out = _unique_output("tradtoppar")
         if default_out:
             p_out.value = default_out
+        _set_symbology(p_out, LYRX_TOPS)
+
+        p_crowns = arcpy.Parameter(
+            displayName="Utdata, trädkronor", name="out_crowns", datatype="DEFeatureClass",
+            parameterType="Optional", direction="Output",
+        )
+        default_crowns = _unique_output("tradkronor")
+        if default_crowns:
+            p_crowns.value = default_crowns
+        _set_symbology(p_crowns, LYRX_CROWNS)
 
         p_min = arcpy.Parameter(
             displayName="Lägsta trädhöjd (m)", name="min_height", datatype="GPDouble",
@@ -1467,8 +1501,8 @@ class DetekteraTrad:
         p_workers.filter.type = "Range"
         p_workers.filter.list = [1, 32]
 
-        return [p_mode, p_aoi, p_extent, p_source, p_files, p_out, p_min, p_sigma, p_a, p_b,
-                p_filter, p_key, p_secret, p_mem, p_workers]
+        return [p_mode, p_aoi, p_extent, p_source, p_files, p_out, p_crowns, p_min, p_sigma,
+                p_a, p_b, p_filter, p_key, p_secret, p_mem, p_workers]
 
     def isLicensed(self):
         return True
@@ -1565,6 +1599,7 @@ class DetekteraTrad:
                 (p["consumer_secret"].valueAsText or "").strip(),
                 p["out_features"].valueAsText, params,
                 p["memory_gb"].value or None, p["workers"].value or None, messages,
+                out_crowns=p["out_crowns"].valueAsText or None,
             )
         except ValueError as exc:
             error = str(exc)
@@ -1706,12 +1741,96 @@ class UtvarderaNoggrannhet:
 # =============================================================================
 
 TOP_FIELDS = [
+    ["TRAD_ID", "LONG", "Träd-ID"],
     ["TRADHOJD", "DOUBLE", "Trädhöjd (m)"],
     ["MARKHOJD", "DOUBLE", "Markhöjd (m ö.h., RH 2000)"],
     ["KALLA", "TEXT", "Källa", 120],
     ["SKANNING", "TEXT", "Skanningsområde", 16],
     ["INSAMLAD", "TEXT", "Insamlad", 32],
 ]
+
+
+CROWN_FIELDS = [
+    ["TRAD_ID", "LONG", "Träd-ID"],
+    ["TRADHOJD", "DOUBLE", "Trädhöjd (m)"],
+    ["KRONAREA", "DOUBLE", "Kronans yta (m²)"],
+    ["KRONDIAM", "DOUBLE", "Kronans diameter (m, cirkel med samma yta)"],
+]
+
+
+class _TopSink:
+    """
+    Tar emot topparna (och kronorna) block för block och skriver dem till
+    featureklasser i memory: bara toppar inom området, och utan byggnader och
+    ledningar om filtret är på. TRAD_ID numreras i den ordning de skrivs och
+    är detsamma i punkterna och kronorna.
+    """
+
+    POINT_NAMES = ["SHAPE@XY", "TRAD_ID", "TRADHOJD", "MARKHOJD", "KALLA", "SKANNING",
+                   "INSAMLAD"]
+    CROWN_NAMES = ["SHAPE@", "TRAD_ID", "TRADHOJD", "KRONAREA", "KRONDIAM"]
+
+    def __init__(self, tiles, aoi, params, temps):
+        self.tiles, self.aoi, self.params = tiles, aoi, params
+        self.tile_text = [(t["id"][:120], (t["area"] or "")[:16], _capture_period(t)[:32])
+                          for t in tiles]
+        self.n = self.n_hard = self.n_thin = 0
+        self.heights, self.crown_areas = [], []
+        self.points = _memory_name("toppar")
+        temps.append(self.points)
+        arcpy.management.CreateFeatureclass(os.path.dirname(self.points),
+                                            os.path.basename(self.points), "POINT",
+                                            spatial_reference=_tm())
+        arcpy.management.AddFields(self.points, TOP_FIELDS)
+        self._pcur = arcpy.da.InsertCursor(self.points, self.POINT_NAMES)
+        self.crowns, self._ccur = None, None
+        if params.get("crowns"):
+            self.crowns = _memory_name("kronor")
+            temps.append(self.crowns)
+            arcpy.management.CreateFeatureclass(os.path.dirname(self.crowns),
+                                                os.path.basename(self.crowns), "POLYGON",
+                                                spatial_reference=_tm())
+            arcpy.management.AddFields(self.crowns, CROWN_FIELDS)
+            self._ccur = arcpy.da.InsertCursor(self.crowns, self.CROWN_NAMES)
+
+    def add(self, z):
+        x, y, h, g = z["x"], z["y"], z["h"], z["ground"]
+        inside = _in_polygon(self.aoi, x, y)
+        if self.params["filter"]:
+            hard, thin = z["hard"], z["thin"]
+            self.n_hard += int((hard & inside).sum())
+            self.n_thin += int((thin & inside).sum())
+            keep = inside & ~(hard | thin)
+        else:
+            keep = inside
+        wkb = offs = None
+        if self._ccur is not None and "crown_offs" in z:
+            wkb, offs = z["crown_wkb"].tobytes(), z["crown_offs"]
+        tidx = _tile_index(self.tiles, x, y)
+        sr = _tm()
+        for k in np.flatnonzero(keep):
+            self.n += 1
+            hk = round(float(h[k]), 2)
+            kal, skn, ins = self.tile_text[tidx[k]] if tidx[k] >= 0 else ("", "", "")
+            self._pcur.insertRow(((float(x[k]), float(y[k])), self.n, hk,
+                                  None if not np.isfinite(g[k]) else round(float(g[k]), 2),
+                                  kal, skn, ins))
+            self.heights.append(hk)
+            if wkb is not None and offs[k + 1] > offs[k]:
+                geom = arcpy.FromWKB(bytearray(wkb[offs[k]:offs[k + 1]]), sr)
+                area = geom.area
+                if area > 0:
+                    self._ccur.insertRow((geom, self.n, hk, round(area, 2),
+                                          round(2 * math.sqrt(area / math.pi), 2)))
+                    self.crown_areas.append(area)
+
+    def close(self):
+        # Cursorerna måste släppas innan featureklasserna exporteras eller tas bort.
+        for name in ("_pcur", "_ccur"):
+            cur = getattr(self, name)
+            if cur is not None:
+                del cur
+                setattr(self, name, None)
 
 
 def _in_polygon(poly, x, y):
@@ -1745,14 +1864,19 @@ def _tile_index(tiles, x, y):
     return idx
 
 
-def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, messages):
+def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, messages,
+                out_crowns=None):
     """
     aoi: polygon i SWEREF 99 TM. files: lokala LAS/LAZ-filer, eller None för
-    Lantmäteriets STAC. params: {"hmin", "sigma", "a", "b"}.
-    Returnerar sökvägen till den skapade featureklassen.
+    Lantmäteriets STAC. params: {"hmin", "sigma", "a", "b", "filter"}.
+    out_crowns: featureklass för kronorna, eller None för inga kronor.
+    Returnerar sökvägen till punktfeatureklassen.
     """
     if not out_fc:
         raise ValueError("Ange utdata.")
+    params = dict(params, crowns=bool(out_crowns))
+    if out_crowns and os.path.normcase(out_crowns) == os.path.normcase(out_fc):
+        raise ValueError("Trädtopparna och kronorna kan inte ha samma utdatanamn.")
     if files is None and not (key and secret):
         raise ValueError("Ange consumer key och secret under Inloggning, eller välj lokala "
                          "LAS/LAZ-filer.")
@@ -1760,9 +1884,10 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
         missing = [f for f in files if not os.path.isfile(f)]
         if missing:
             raise ValueError("Filen finns inte: {}".format(", ".join(missing)))
-    out_dir = os.path.dirname(out_fc)
-    if out_dir and not arcpy.Exists(out_dir):
-        raise ValueError("Utdata-arbetsytan finns inte: {}".format(out_dir))
+    for path in (out_fc, out_crowns):
+        out_dir = os.path.dirname(path) if path else ""
+        if out_dir and not arcpy.Exists(out_dir):
+            raise ValueError("Utdata-arbetsytan finns inte: {}".format(out_dir))
     if importlib.util.find_spec("pdal") is None or importlib.util.find_spec("scipy") is None:
         raise ValueError(
             "Python-paketen pdal och scipy behövs och saknas i den aktiva miljön ({}). De ingår "
@@ -1789,6 +1914,7 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
     workdir = os.path.join(_local_scratch_folder(messages), "trad_" + uuid.uuid4().hex[:8])
     os.makedirs(workdir)
     pool = None
+    sink = None
     temps = []
     try:
         # ── 1. Rutor ─────────────────────────────────────────────────────────
@@ -1848,7 +1974,9 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
         steps.next("läser punkter och söker trädtoppar, {} block, {} åt gången".format(
             len(blocks), workers))
         arcpy.SetProgressor("step", "", 0, 100, 1)
-        xs, ys, hs, gs, hard_l, thin_l = [], [], [], [], [], []
+        # Toppar och kronor skrivs block för block till featureklasser i
+        # memory, så att de aldrig ligger som Python-objekt för hela området.
+        sink = _TopSink(tiles, aoi, params, temps)
         n_points = n_ground = n_first = n_nohgt = 0
         peak = 0
         done_expected = 0.0
@@ -1891,12 +2019,7 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
                 peak = max(peak, res.get("peak_bytes") or 0)
                 if res["npz"]:
                     with np.load(res["npz"]) as z:
-                        xs.append(z["x"])
-                        ys.append(z["y"])
-                        hs.append(z["h"])
-                        gs.append(z["ground"])
-                        hard_l.append(z["hard"])
-                        thin_l.append(z["thin"])
+                        sink.add(z)
                     os.remove(res["npz"])
 
                 done_expected += b["expected"]
@@ -1925,76 +2048,59 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
             note += " Största minnesåtgång i en process: {} MB.".format(int(peak / 1e6))
         steps.done(note)
 
-        # ── 4. Toppar inom området ───────────────────────────────────────────
-        steps.next("skriver toppar inom området")
-        x = np.concatenate(xs) if xs else np.zeros(0)
-        y = np.concatenate(ys) if ys else np.zeros(0)
-        h = np.concatenate(hs) if hs else np.zeros(0)
-        g = np.concatenate(gs) if gs else np.zeros(0)
-        hard = np.concatenate(hard_l) if hard_l else np.zeros(0, bool)
-        thin = np.concatenate(thin_l) if thin_l else np.zeros(0, bool)
-        n_hard, n_thin = 0, 0
-        if params["filter"] and len(x):
-            # Räknas bara inom området, som topparna i utdata.
-            inside = _in_polygon(aoi, x, y)
-            n_hard, n_thin = int((hard & inside).sum()), int((thin & inside).sum())
-            keep = ~(hard | thin)
-            x, y, h, g = x[keep], y[keep], h[keep], g[keep]
-        tidx = _tile_index(tiles, x, y)
-        tmp_fc = _memory_name("toppar")
-        temps.append(tmp_fc)
-        arcpy.management.CreateFeatureclass(os.path.dirname(tmp_fc), os.path.basename(tmp_fc),
-                                            "POINT", spatial_reference=_tm())
-        arcpy.management.AddFields(tmp_fc, TOP_FIELDS)
-        names = ["SHAPE@XY", "TRADHOJD", "MARKHOJD", "KALLA", "SKANNING", "INSAMLAD"]
-        tile_text = [(t["id"][:120], (t["area"] or "")[:16], _capture_period(t)[:32])
-                     for t in tiles]
-        with arcpy.da.InsertCursor(tmp_fc, names) as cur:
-            for k in range(len(x)):
-                kal, skn, ins = tile_text[tidx[k]] if tidx[k] >= 0 else ("", "", "")
-                cur.insertRow(((float(x[k]), float(y[k])), round(float(h[k]), 2),
-                               None if not np.isfinite(g[k]) else round(float(g[k]), 2),
-                               kal, skn, ins))
-        # Bara toppar inom själva området (polygonen, eller rektangeln
-        # omprojicerad från kartans koordinatsystem).
-        lyr = "toppar_lyr_" + uuid.uuid4().hex[:8]
-        arcpy.management.MakeFeatureLayer(tmp_fc, lyr)
-        try:
-            arcpy.management.SelectLayerByLocation(lyr, "INTERSECT", aoi)
-            n_in = int(arcpy.management.GetCount(lyr)[0])
-            _export(lyr, out_fc, _out_sr(), messages)
-        finally:
-            arcpy.management.Delete(lyr)
+        # ── 4. Utdata ────────────────────────────────────────────────────────
+        steps.next("skriver toppar{} till utdata".format(" och kronor" if out_crowns else ""))
+        sink.close()
+        n_in = sink.n
+        _export(sink.points, out_fc, _out_sr(), messages)
+        if out_crowns:
+            _export(sink.crowns, out_crowns, _out_sr(), messages)
         area_ha = aoi.area / 1e4
-        heights = h[np.isfinite(h)]
-        steps.done("{} toppar inom området, {} per ha{}.{}".format(
+        heights = np.array(sink.heights)
+        note = "{} toppar inom området, {} per ha{}.".format(
             _fmt_count(n_in), _fmt_m(round(n_in / area_ha, 1)) if area_ha > 0 else "?",
             ", trädhöjd median {} m (5-95 %: {}-{} m)".format(
                 _fmt_m(round(float(np.median(heights)), 1)),
                 _fmt_m(round(float(np.percentile(heights, 5)), 1)),
-                _fmt_m(round(float(np.percentile(heights, 95)), 1))) if heights.size else "",
-            " Borttagna: {} på byggnader och andra hårda ytor, {} på ledningar och andra tunna "
-            "föremål.".format(_fmt_count(n_hard), _fmt_count(n_thin)) if params["filter"] else
-            " Toppar på byggnader och ledningar togs inte bort."))
+                _fmt_m(round(float(np.percentile(heights, 95)), 1))) if heights.size else "")
+        note += (" Borttagna: {} på byggnader och andra hårda ytor, {} på ledningar och andra "
+                 "tunna föremål.".format(_fmt_count(sink.n_hard), _fmt_count(sink.n_thin))
+                 if params["filter"] else " Toppar på byggnader och ledningar togs inte bort.")
+        if out_crowns:
+            areas = np.array(sink.crown_areas)
+            note += " {} kronor, yta median {} m² (5-95 %: {}-{} m²).".format(
+                _fmt_count(areas.size),
+                *[_fmt_m(round(float(v), 1)) for v in (np.median(areas),
+                                                        *np.percentile(areas, [5, 95]))]
+            ) if areas.size else " Inga kronor."
+        steps.done(note)
 
         # ── 5. Metadata ──────────────────────────────────────────────────────
         steps.next("skriver metadata")
-        try:
-            _write_detect_metadata(out_fc, tiles, params, files is not None, n_in, area_ha)
-        except Exception as exc:
-            messages.addWarningMessage("Kunde inte skriva metadata: {}".format(exc))
+        for path, kind in ((out_fc, "toppar"), (out_crowns, "kronor")):
+            if not path:
+                continue
+            try:
+                _write_detect_metadata(path, kind, tiles, params, files is not None, n_in,
+                                       area_ha)
+            except Exception as exc:
+                messages.addWarningMessage("Kunde inte skriva metadata för {}: {}".format(
+                    path, exc))
         steps.done()
         messages.addMessage("Klart på {}.".format(_fmt_duration(time.time() - steps.t0)))
         return out_fc
     finally:
         if pool is not None:
             pool.close(kill=True)
+        if sink is not None:
+            sink.close()
         arcpy.ResetProgressor()
         _delete_quietly(*temps)
         _remove_workdir(workdir)
 
 
-def _write_detect_metadata(path, tiles, params, local, n, area_ha):
+def _write_detect_metadata(path, kind, tiles, params, local, n, area_ha):
+    """kind: "toppar" eller "kronor"."""
     h = escape
     settings = [
         ("Metod", "Lokala maxima i en ythöjdmodell över mark (CHM) med sökfönster som växer med "
@@ -2019,6 +2125,15 @@ def _write_detect_metadata(path, tiles, params, local, n, area_ha):
                          "modellen".format(_fmt_m(_tw.APEX_RADIUS))),
         ("Antal toppar", "{} ({} per ha)".format(_fmt_count(n), _fmt_m(round(n / area_ha, 1))
                                                  if area_ha > 0 else "?")),
+        ("Kronor", (
+            "Fyllning uppifrån i den utjämnade CHM:en från en markör per topp (vattendelare), "
+            "{} m i taget. En cell hör till kronan om den är minst {} % av toppens höjd, högst "
+            "{} x trädhöjden från toppen, minst {} m över mark och inte hård yta. Kanterna "
+            "förenklade med {} m tolerans. TRAD_ID kopplar kronan till sin topp".format(
+                _fmt_m(_tw.CROWN_LEVEL_M), int(_tw.CROWN_MIN_REL * 100),
+                _fmt_m(_tw.CROWN_MAX_R_FACTOR), _fmt_m(_tw.CROWN_MIN_H),
+                _fmt_m(_tw.CROWN_SIMPLIFY_M))
+            if params.get("crowns") else "Inte avgränsade")),
         ("Skapad", "{} med verktyget Detektera träd {} ({})".format(
             datetime.date.today().isoformat(), TOOL_VERSION, REPO_NAME)),
     ]
@@ -2037,10 +2152,16 @@ def _write_detect_metadata(path, tiles, params, local, n, area_ha):
         "<th>Insamlad</th></tr>{tile_rows}</table>"
     ).format(rows=rows, src=h(src), tile_rows=tile_rows)
     md = arcpy.metadata.Metadata(path)
-    md.title = "Trädtoppar från laserdata"
-    md.summary = "Trädtoppar (krontoppar) med trädhöjd, hittade i laserdata ({}).".format(src)
+    if kind == "kronor":
+        md.title = "Trädkronor från laserdata"
+        md.summary = ("Trädkronor avgränsade i laserdata kring trädtopparna, med kronans yta "
+                      "och diameter ({}).".format(src))
+        md.tags = "trädkronor, kronavgränsning, laserskanning, Laserdata Skog, CHM"
+    else:
+        md.title = "Trädtoppar från laserdata"
+        md.summary = "Trädtoppar (krontoppar) med trädhöjd, hittade i laserdata ({}).".format(src)
+        md.tags = "trädtoppar, träddetektering, laserskanning, Laserdata Skog, CHM"
     md.description = desc
-    md.tags = "trädtoppar, träddetektering, laserskanning, Laserdata Skog, CHM"
     if not local:
         md.credits = "© Lantmäteriet, Laserdata Nedladdning, skog."
         md.accessConstraints = (

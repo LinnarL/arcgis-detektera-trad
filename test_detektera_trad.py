@@ -51,15 +51,40 @@ def main(las, urban=None):
     cx, cy = round((x0 + x1) / 2), round((y0 + y1) / 2)
     ext = "{} {} {} {}".format(cx - 200, cy - 200, cx + 200, cy + 200)
 
+    extent_mode = "Utbredning (kartvy, lager eller koordinater)"
+    local = "Lokala LAS/LAZ-filer"
     out1 = os.path.join(gdb, "toppar1")
-    r = tb.DetekteraTrad("Utbredning (kartvy, lager eller koordinater)", None, ext,
-                         "Lokala LAS/LAZ-filer", las, out1)
+    crowns1 = os.path.join(gdb, "kronor1")
+    r = tb.DetekteraTrad(aoi_mode=extent_mode, aoi_extent=ext, source=local, las_files=las,
+                         out_features=out1, out_crowns=crowns1)
     print(r.getMessages())
     n1 = int(arcpy.management.GetCount(out1)[0])
 
+    # Kronorna: en per topp, samma TRAD_ID och höjd, positiv yta, toppen inom sin krona.
+    tops = {i: (h, x, y) for i, h, (x, y) in arcpy.da.SearchCursor(
+        out1, ["TRAD_ID", "TRADHOJD", "SHAPE@XY"])}
+    n_c = bad_id = bad_h = outside = 0
+    areas = []
+    with arcpy.da.SearchCursor(crowns1, ["TRAD_ID", "TRADHOJD", "KRONAREA", "SHAPE@"]) as cur:
+        for tid, h, a, shape in cur:
+            n_c += 1
+            if tid not in tops:
+                bad_id += 1
+                continue
+            bad_h += abs(tops[tid][0] - h) > 1e-6
+            areas.append(shape.area)
+            outside += not shape.buffer(0.5).contains(
+                arcpy.PointGeometry(arcpy.Point(tops[tid][1], tops[tid][2]), shape.spatialReference))
+    print("Kronor {} av {} toppar, okänt ID {}, fel höjd {}, topp utanför kronan {}, yta min {:.2f} "
+          "median {:.1f} m2".format(n_c, n1, bad_id, bad_h, outside, min(areas),
+                                    sorted(areas)[len(areas) // 2]))
+    assert n_c >= 0.95 * n1 and bad_id == 0 and bad_h == 0 and min(areas) > 0
+    assert outside <= 0.02 * n_c, "toppen ska ligga i sin krona"
+
     out2 = os.path.join(gdb, "toppar2")
-    tb.DetekteraTrad("Utbredning (kartvy, lager eller koordinater)", None, ext,
-                     "Lokala LAS/LAZ-filer", las, out2, 4, 1.0, 0.1, 3, True, None, None, 2, 2)
+    tb.DetekteraTrad(aoi_mode=extent_mode, aoi_extent=ext, source=local, las_files=las,
+                     out_features=out2, min_height=4, sigma=1.0, win_a=0.1, win_b=3,
+                     filter_objects=True, memory_gb=2, workers=2)
     n2 = int(arcpy.management.GetCount(out2)[0])
     print("Toppar, standard:", n1, " utjämning 1 m:", n2)
     assert n1 > 0 and 0 < n2 < n1, "fler toppar med mer utjämning"
@@ -73,9 +98,10 @@ def main(las, urban=None):
         u_las, u_ext = urban.split(";")
         n_on = n_off = 0
         for flag, name in ((True, "stad_med"), (False, "stad_utan")):
-            r = tb.DetekteraTrad("Utbredning (kartvy, lager eller koordinater)", None, u_ext,
-                                 "Lokala LAS/LAZ-filer", u_las, os.path.join(gdb, name),
-                                 None, None, None, None, flag)
+            r = tb.DetekteraTrad(aoi_mode=extent_mode, aoi_extent=u_ext, source=local,
+                                 las_files=u_las, out_features=os.path.join(gdb, name),
+                                 out_crowns=os.path.join(gdb, name + "_kronor"),
+                                 filter_objects=flag)
             n = int(arcpy.management.GetCount(os.path.join(gdb, name))[0])
             print(name, n, [m for m in r.getMessages().splitlines() if "Borttagna" in m or
                              "togs inte bort" in m])
@@ -129,6 +155,11 @@ def main(las, urban=None):
     # Utan valfria parametrar.
     tb.UtvarderaNoggrannhet(out1, ref, plots, os.path.join(gdb, "utv2"), None, 2.0)
     del r
+    if os.environ.get("TRAD_TEST_KEEP"):
+        # Behåll utdata för att titta på dem, t.ex. med lagerfilerna.
+        print("Utdata sparade i", gdb)
+        print("OK")
+        return
     # Testets egna cursorer och resultatobjekt håller geodatabasen öppen en stund.
     arcpy.management.ClearWorkspaceCache(gdb)
     try:

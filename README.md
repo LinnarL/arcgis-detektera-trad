@@ -3,8 +3,8 @@
 ArcGIS Pro Python toolbox with two tools:
 
 - **Detektera träd** finds tree tops (crown apices) in airborne laser data and writes them as points
-  with tree height. Points come from Lantmäteriet's Laserdata Nedladdning, skog for the area, or
-  from local LAS/LAZ files.
+  with tree height, and optionally delineates each tree's crown as a polygon. Points come from
+  Lantmäteriet's Laserdata Nedladdning, skog for the area, or from local LAS/LAZ files.
 - **Utvärdera noggrannhet** compares detected trees with reference trees in field plots and reports
   detection rate, precision, F1, stems per hectare and position error.
 
@@ -30,8 +30,9 @@ before relying on counts.
 
 ## Install
 
-1. Clone or download this repo. Keep `DetekteraTrad.pyt` and `trad_worker.py` in the same folder;
-   the toolbox runs the worker file in separate processes.
+1. Clone or download this repo. Keep `DetekteraTrad.pyt`, `trad_worker.py` and the two `.lyrx`
+   files in the same folder; the toolbox runs the worker file in separate processes, and the layer
+   files give the outputs their symbols.
 2. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `DetekteraTrad.pyt`.
 
 ## Detektera träd
@@ -42,7 +43,8 @@ before relying on counts.
 | Intresseområde (polygoner) / Utbredning | - | The layer's selection is honoured. Only tops inside the polygons are kept |
 | Punktmoln | Lantmäteriets Laserdata Skog | Or local LAS/LAZ files in SWEREF 99 TM with ground classified (class 2) |
 | LAS/LAZ-filer | - | Only for local files. Files must not overlap with the same points |
-| Utdata, trädtoppar | `tradtoppar` in the project geodatabase | New point feature class. Honours Overwrite output and Output Coordinate System |
+| Utdata, trädtoppar | `tradtoppar` in the project geodatabase | New point feature class, drawn as a small red cross. Honours Overwrite output and Output Coordinate System |
+| Utdata, trädkronor | `tradkronor` in the project geodatabase | Optional polygon feature class, drawn with a dashed outline and no fill. Clear it to skip crowns (saves about a fifth of the run time) |
 | Lägsta trädhöjd (m) | 4 | Under Detektering. 0-50 m |
 | Utjämning (m) | 0.5 | Under Detektering. Gaussian sigma in metres, 0-3. More smoothing gives fewer tops |
 | Sökfönster, A and B | 0.1 and 3 | Under Detektering. A cell is a top if it is highest within a circle of diameter A x height + B metres |
@@ -50,9 +52,35 @@ before relying on counts.
 | Consumer key / secret | - | Under Inloggning. Only for Lantmäteriet data |
 | Minnesbudget (GB) / Block samtidigt | automatic | Under Avancerat. Same scheme as the Laserdata toolboxes |
 
-Output fields: `TRADHOJD` (tree height, m above ground), `MARKHOJD` (ground elevation at the top,
-m RH 2000), `KALLA` (tile or file), `SKANNING` (scanning area), `INSAMLAD` (capture period, empty for
-local files since a LAS header holds only the processing date).
+Tree top fields: `TRAD_ID`, `TRADHOJD` (tree height, m above ground), `MARKHOJD` (ground elevation
+at the top, m RH 2000), `KALLA` (tile or file), `SKANNING` (scanning area), `INSAMLAD` (capture
+period, empty for local files since a LAS header holds only the processing date).
+
+Crown fields: `TRAD_ID` (the same as the tree top's, for joining), `TRADHOJD`, `KRONAREA` (m2) and
+`KRONDIAM` (m, the diameter of a circle with the same area).
+
+The symbols come from `tradtoppar.lyrx` and `tradkronor.lyrx`, which Pro applies when it adds the
+outputs to the map. `skapa_lagerfiler.py` regenerates them with arcpy if the colours or sizes are to
+be changed.
+
+### Crowns
+
+Crowns are grown from the tops through the smoothed canopy height model, from the top down in
+0.25 m steps, so the border between two touching crowns falls in the saddle between them (a
+watershed with one marker per top). A cell joins a crown only if it is at least half the top's
+height, within 0.3 x the tree height of the top (the defaults of `silva2016` in lidR), at least 2 m
+above ground and not part of the building mask. Each crown is therefore connected to its own top.
+Edges are simplified with a 0.3 m tolerance to remove the 0.5 m cell steps, so neighbouring crowns
+can overlap or leave a gap of a few decimetres.
+
+- In 6 ha of dense forest every top got a crown, median 19.6 m2 (5-95 %: 7.5-47.5 m2), and every
+  top lies inside its own crown.
+- Crowns never spread over roofs. In the town test the trees kept after filtering had a median
+  crown of 18 m2.
+- The whole crown is kept also where it reaches outside the area of interest.
+- At 2-4 points per m2 crown edges are approximate. Suppressed trees without a detected top are
+  absorbed into a neighbour's crown or left out.
+- Adds about 4 s per km2 to a run (16 s without crowns, 20 s with, for a 1 km2 forest block).
 
 ### How it works
 
@@ -156,5 +184,7 @@ every case.
 ## Tests
 
 `test_detektera_trad.py` runs both tools through `arcpy.ImportToolbox` on a local LAS file: two
-detection runs in one process (typed extent, optional parameters empty and set), then an
-evaluation against synthetic reference trees with a known expected precision.
+detection runs in one process (typed extent, optional parameters empty and set), a check that every
+crown matches its tree top by `TRAD_ID` and height and contains it, optionally a built-up area with
+the building filter on and off, then an evaluation against synthetic reference trees with a known
+expected precision. Set `TRAD_TEST_KEEP=1` to keep the outputs.
