@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyt.xml
+*.lock
+*.aprx.bak
+*.gdb/
+*.tif
+*.tif.xml
+*.laz
+*.las
+*.npz
+*.log

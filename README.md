@@ -1,0 +1,124 @@
+# Detektera träd
+
+ArcGIS Pro Python toolbox with two tools:
+
+- **Detektera träd** finds tree tops (crown apices) in airborne laser data and writes them as points
+  with tree height. Points come from Lantmäteriet's Laserdata Nedladdning, skog for the area, or
+  from local LAS/LAZ files.
+- **Utvärdera noggrannhet** compares detected trees with reference trees in field plots and reports
+  detection rate, precision, F1, stems per hectare and position error.
+
+**The position is the crown top, not a measured stem base.** At Lantmäteriet's density (2-4 points
+per m2 counting all returns) almost no pulses hit the stem, and a top can lie a metre or two from
+the stem base on leaning trees or asymmetric crowns. Mainly dominant and co-dominant trees are
+found; suppressed trees under other crowns rarely are. Published benchmarks at similar density
+find roughly half of all trees.
+
+**The default parameters are not calibrated against Swedish reference data.** They follow the
+`lmf()` example in the R package lidR. Use Utvärdera noggrannhet with your own plots to tune them
+before relying on counts.
+
+## Requirements
+
+- ArcGIS Pro 3.x, Basic licence is enough. Developed on 3.6 with Python 3.13.
+- No extra packages. `pdal`, `scipy`, `numpy`, `certifi` and GDAL's Python bindings ship with the
+  default `arcgispro-py3` environment.
+- For Lantmäteriet data: a consumer key and secret from Lantmäteriet's API portal with both the API
+  `STAC-hojd` and an order of
+  [Laserdata Nedladdning, skog](https://geotorget.lantmateriet.se/geodataprodukter/laserdata-nedladdning-skog-api).
+  The same key works for the Laserdata höjdmodeller and NRD toolboxes. Local files need no key.
+
+## Install
+
+1. Clone or download this repo. Keep `DetekteraTrad.pyt` and `trad_worker.py` in the same folder;
+   the toolbox runs the worker file in separate processes.
+2. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `DetekteraTrad.pyt`.
+
+## Detektera träd
+
+| Parameter | Default | Notes |
+|---|---|---|
+| Avgränsa området med | Polygoner | Polygons (layer or drawn in the map) or extent (display, layer, drawn or typed; typed coordinates use the active map's coordinate system) |
+| Intresseområde (polygoner) / Utbredning | - | The layer's selection is honoured. Only tops inside the polygons are kept |
+| Punktmoln | Lantmäteriets Laserdata Skog | Or local LAS/LAZ files in SWEREF 99 TM with ground classified (class 2) |
+| LAS/LAZ-filer | - | Only for local files. Files must not overlap with the same points |
+| Utdata, trädtoppar | `tradtoppar` in the project geodatabase | New point feature class. Honours Overwrite output and Output Coordinate System |
+| Lägsta trädhöjd (m) | 4 | Under Detektering. 0-50 m |
+| Utjämning (m) | 0.5 | Under Detektering. Gaussian sigma in metres, 0-3. More smoothing gives fewer tops |
+| Sökfönster, A and B | 0.1 and 3 | Under Detektering. A cell is a top if it is highest within a circle of diameter A x height + B metres |
+| Consumer key / secret | - | Under Inloggning. Only for Lantmäteriet data |
+| Minnesbudget (GB) / Block samtidigt | automatic | Under Avancerat. Same scheme as the Laserdata toolboxes |
+
+Output fields: `TRADHOJD` (tree height, m above ground), `MARKHOJD` (ground elevation at the top,
+m RH 2000), `KALLA` (tile or file), `SKANNING` (scanning area), `INSAMLAD` (capture period, empty for
+local files since a LAS header holds only the processing date).
+
+### How it works
+
+1. With Lantmäteriet data, the open STAC catalogue is searched and the newest scan per place is
+   used (the 2.5 km and older large tiles of one scan are never both read). Only points inside the
+   area's bounding box plus a 20 m margin are read, directly from the cloud-optimised files.
+2. The area is split into blocks that fit the memory budget, processed in parallel worker
+   processes. Noise (classes 7 and 18) is dropped.
+3. Ground points are triangulated and rasterised to 0.5 m; each first return gets its height above
+   ground by bilinear interpolation.
+4. Canopy height model: first returns triangulated with height above ground as Z, rasterised to
+   0.5 m. A per-cell maximum grid left 47 % of cells empty at about 2 first returns per m2, the
+   triangulation does not.
+5. Gaussian smoothing, then a cell is a top if it is the highest within a circle of diameter
+   A x height + B (radius rounded to half metres, 1-6 m) and at least the minimum height.
+6. Each top is moved to the highest first return within 1 m, since smoothing shifts the maximum
+   slightly. That return gives position and height.
+7. A top is kept by the block it lies in (half-open bounds), so blocks never produce duplicates.
+   On a test area, one 400 m block and four 200 m blocks gave 4 356 and 4 354 tops; the handful of
+   differences were scattered, not on the seams, and come from Delaunay triangulation not being
+   unique where points are co-circular.
+
+## Utvärdera noggrannhet
+
+| Parameter | Default | Notes |
+|---|---|---|
+| Detekterade träd | - | Point layer, e.g. the output above. Selection honoured |
+| Referensträd | - | Point layer of reference trees, ideally stems mapped in the field. Selection honoured |
+| Provytor | - | Polygons where all reference trees were mapped |
+| Utdata, parade träd | `utvardering_trad` | Points of both sets with status (Träff, Missad, Felaktig, Utanför provytan), paired OID, distance and dx/dy |
+| Utdata, mått per provyta | none | Optional table, one row per plot plus `Alla` |
+| Sökradie (m) | 2 | 0.1-20 m |
+| Höjdfält | `TRADHOJD` if present / none | Under Höjd |
+| Största höjdskillnad (%) | 30 | Under Höjd. Applied only when both height fields are set |
+| Provytans ID-fält | OID | Under Provytor |
+
+Matching is one-to-one and minimises the total distance (Hungarian method,
+`scipy.optimize.linear_sum_assignment`, solved per connected group of candidate pairs). It was
+checked against brute force on 300 random cases: same number of pairs and same total distance in
+every case.
+
+- Only reference trees inside a plot count. Detected trees up to the search radius outside a plot
+  may be paired with a reference tree inside; unpaired ones outside are not counted as false.
+- Träffsäkerhet (recall) = paired reference trees / reference trees. Precision = paired detected
+  trees inside the plots / detected trees inside the plots. Both are reported with a 95 % Wilson
+  interval.
+- Also reported: F1, stems per hectare, mean dx/dy and RMSE of paired positions, height bias and
+  RMSE, recall per reference height class (under 10, 10-20, 20 m and over), counts of possible
+  split crowns and merged trees, and results at 1, 1.5, 2 and 3 m search radius so the choice of
+  radius is visible.
+- Position error includes the error of the reference. GNSS under canopy is often off by 1-3 m;
+  map stems from control points with a total station or tape and compass where possible.
+- With a detection rate near 0.6, about 370 reference trees give a 95 % interval of about plus or
+  minus 5 percentage points.
+
+## Notes on the data
+
+- Lantmäteriet's nominal density is 1-2 points per m2; counting all returns it is 2-4. The 2025-26
+  scans fly lower and are somewhat denser.
+- Many areas are scanned twice. The tool uses the newest scan; its date and leaf state are in the
+  messages and the output.
+- Southern Sweden is mostly scanned without leaves, so deciduous crowns return fewer first returns
+  than conifers.
+- Coverage is about 75 % of Sweden. The mountains are not included.
+
+## Tests
+
+`test_detektera_trad.py` runs both tools through `arcpy.ImportToolbox` on a local LAS file: two
+detection runs in one process (typed extent, optional parameters empty and set), then an
+evaluation against synthetic reference trees with a known expected precision.
