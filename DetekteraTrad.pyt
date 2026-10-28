@@ -1147,8 +1147,30 @@ def _out_sr():
     return _tm()
 
 
-def _temp_gdb(workdir):
-    return arcpy.management.CreateFileGDB(workdir, "arbete.gdb")[0]
+def _memory_name(stem):
+    """
+    Unikt namn i memory för mellanresultat. En filgeodatabas i arbetsmappen
+    gick inte att ta bort: en tabell förblev låst tills processen avslutades,
+    även efter ClearWorkspaceCache (uppmätt), så varje körning lämnade en mapp
+    kvar. memory delas av hela Pro-sessionen, därav uuid-namnet.
+    """
+    return "memory/{}_{}".format(stem, uuid.uuid4().hex[:12])
+
+
+def _delete_quietly(*paths):
+    """Delete på mellanresultat i memory; kan misslyckas sporadiskt i Pro (se CLAUDE.md)."""
+    for path in paths:
+        if not path:
+            continue
+        try:
+            arcpy.management.Delete(path)
+        except Exception:
+            pass
+
+
+def _remove_workdir(workdir):
+    """Ta bort arbetsmappen (arbetsprocessernas loggar och rastren de skrev)."""
+    shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _export(src, dst, out_sr, messages, where=None):
@@ -1727,6 +1749,7 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
     workdir = os.path.join(_local_scratch_folder(messages), "trad_" + uuid.uuid4().hex[:8])
     os.makedirs(workdir)
     pool = None
+    temps = []
     try:
         # ── 1. Rutor ─────────────────────────────────────────────────────────
         if files is None:
@@ -1867,9 +1890,10 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
         h = np.concatenate(hs) if hs else np.zeros(0)
         g = np.concatenate(gs) if gs else np.zeros(0)
         tidx = _tile_index(tiles, x, y)
-        gdb = _temp_gdb(workdir)
-        tmp_fc = arcpy.management.CreateFeatureclass(gdb, "toppar", "POINT",
-                                                     spatial_reference=_tm())[0]
+        tmp_fc = _memory_name("toppar")
+        temps.append(tmp_fc)
+        arcpy.management.CreateFeatureclass(os.path.dirname(tmp_fc), os.path.basename(tmp_fc),
+                                            "POINT", spatial_reference=_tm())
         arcpy.management.AddFields(tmp_fc, TOP_FIELDS)
         names = ["SHAPE@XY", "TRADHOJD", "MARKHOJD", "KALLA", "SKANNING", "INSAMLAD"]
         tile_text = [(t["id"][:120], (t["area"] or "")[:16], _capture_period(t)[:32])
@@ -1912,15 +1936,8 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
         if pool is not None:
             pool.close(kill=True)
         arcpy.ResetProgressor()
-        try:
-            arcpy.management.Delete(os.path.join(workdir, "arbete.gdb"))
-        except Exception:
-            pass
-        try:
-            arcpy.management.ClearWorkspaceCache(workdir)
-        except Exception:
-            pass
-        shutil.rmtree(workdir, ignore_errors=True)
+        _delete_quietly(*temps)
+        _remove_workdir(workdir)
 
 
 def _write_detect_metadata(path, tiles, params, local, n, area_ha):
@@ -2016,8 +2033,7 @@ def _run_evaluate(detected, reference, plots, out_fc, out_table, radius, det_hf,
         _check_sr(lyr, label)
     use_dh = bool(det_hf and ref_hf and max_dh_pct)
     steps = _Steps(3, messages)
-    workdir = os.path.join(_local_scratch_folder(messages), "utv_" + uuid.uuid4().hex[:8])
-    os.makedirs(workdir)
+    temps = []
     try:
         # ── 1. Provytor och träd ─────────────────────────────────────────────
         steps.next("läser provytor och träd")
@@ -2163,9 +2179,10 @@ def _run_evaluate(detected, reference, plots, out_fc, out_table, radius, det_hf,
 
         # ── 3. Utdata ────────────────────────────────────────────────────────
         steps.next("skriver utdata")
-        gdb = _temp_gdb(workdir)
-        tmp_fc = arcpy.management.CreateFeatureclass(gdb, "parade", "POINT",
-                                                     spatial_reference=_tm())[0]
+        tmp_fc = _memory_name("parade")
+        temps.append(tmp_fc)
+        arcpy.management.CreateFeatureclass(os.path.dirname(tmp_fc), os.path.basename(tmp_fc),
+                                            "POINT", spatial_reference=_tm())
         arcpy.management.AddFields(tmp_fc, [
             ["TYP", "TEXT", "Typ", 12],
             ["STATUS", "TEXT", "Status", 20],
@@ -2218,7 +2235,9 @@ def _run_evaluate(detected, reference, plots, out_fc, out_table, radius, det_hf,
         _export(tmp_fc, out_fc, _out_sr(), messages)
 
         if out_table:
-            tmp_tab = arcpy.management.CreateTable(gdb, "matt")[0]
+            tmp_tab = _memory_name("matt")
+            temps.append(tmp_tab)
+            arcpy.management.CreateTable(os.path.dirname(tmp_tab), os.path.basename(tmp_tab))
             arcpy.management.AddFields(tmp_tab, [
                 ["PROVYTA", "TEXT", "Provyta", 64],
                 ["AREAL_HA", "DOUBLE", "Areal (ha)"],
@@ -2273,12 +2292,4 @@ def _run_evaluate(detected, reference, plots, out_fc, out_table, radius, det_hf,
         return summary
     finally:
         arcpy.ResetProgressor()
-        try:
-            arcpy.management.Delete(os.path.join(workdir, "arbete.gdb"))
-        except Exception:
-            pass
-        try:
-            arcpy.management.ClearWorkspaceCache(workdir)
-        except Exception:
-            pass
-        shutil.rmtree(workdir, ignore_errors=True)
+        _delete_quietly(*temps)

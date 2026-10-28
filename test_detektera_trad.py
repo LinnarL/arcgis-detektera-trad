@@ -114,7 +114,12 @@ def main(las):
     # Utan valfria parametrar.
     tb.UtvarderaNoggrannhet(out1, ref, plots, os.path.join(gdb, "utv2"), None, 2.0)
     del r
-    arcpy.management.Delete(gdb)
+    # Testets egna cursorer och resultatobjekt håller geodatabasen öppen en stund.
+    arcpy.management.ClearWorkspaceCache(gdb)
+    try:
+        arcpy.management.Delete(gdb)
+    except arcpy.ExecuteError:
+        print("Kunde inte ta bort", gdb)
     shutil.rmtree(work, ignore_errors=True)
     print("OK")
 
