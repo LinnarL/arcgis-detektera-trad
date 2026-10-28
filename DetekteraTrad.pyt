@@ -236,6 +236,17 @@ TOOLTIPS_DETECT = {
     "win_b": (
         "Sökfönstrets diameter i meter vid höjden 0, se A. Standard 3 m."
     ),
+    "filter_objects": (
+        "Ta bort toppar som inte är träd, med hjälp av laserdata. Standard på.\n"
+        "Byggnader och andra hårda ytor: tak är plana och ger en retur per puls, kronor är "
+        "ojämna och delar pulsen i grenarna. Ytor minst 2 m höga som är plana inom 0,2 m och "
+        "där minst 70 % av pulserna gav en enda retur blir en mask, som utvidgas 1,5 m så att "
+        "takkanter och nockar kommer med. Träd som står tätt intill en byggnad kan försvinna.\n"
+        "Ledningar och andra tunna föremål: en topp där högst 8 returer ligger över 2 m och "
+        "de är under 30 % av alla returer inom sökfönstret. Stolpar och fackverksmaster ger "
+        "fortfarande ofta en topp.\n"
+        "Antalet borttagna toppar står i meddelandena."
+    ),
     "consumer_key": (
         "Consumer key från Lantmäteriets API-portal. Nyckeln behöver både API:et STAC-hojd "
         "och en beställning av Laserdata Nedladdning, skog på Geotorget. Samma nyckel som till "
@@ -1429,6 +1440,13 @@ class DetekteraTrad:
         )
         p_b.value = DEFAULT_WIN_B
 
+        p_filter = arcpy.Parameter(
+            displayName="Ta bort toppar på byggnader och ledningar", name="filter_objects",
+            datatype="GPBoolean", parameterType="Optional", direction="Input",
+            category="Detektering",
+        )
+        p_filter.value = True
+
         p_key = arcpy.Parameter(
             displayName="Consumer key", name="consumer_key", datatype="GPString",
             parameterType="Optional", direction="Input", category="Inloggning",
@@ -1450,7 +1468,7 @@ class DetekteraTrad:
         p_workers.filter.list = [1, 32]
 
         return [p_mode, p_aoi, p_extent, p_source, p_files, p_out, p_min, p_sigma, p_a, p_b,
-                p_key, p_secret, p_mem, p_workers]
+                p_filter, p_key, p_secret, p_mem, p_workers]
 
     def isLicensed(self):
         return True
@@ -1539,6 +1557,7 @@ class DetekteraTrad:
                 "sigma": DEFAULT_SIGMA if p["sigma"].value is None else float(p["sigma"].value),
                 "a": DEFAULT_WIN_A if p["win_a"].value is None else float(p["win_a"].value),
                 "b": DEFAULT_WIN_B if p["win_b"].value is None else float(p["win_b"].value),
+                "filter": p["filter_objects"].value is not False,
             }
             _run_detect(
                 aoi, files,
@@ -1695,6 +1714,27 @@ TOP_FIELDS = [
 ]
 
 
+def _in_polygon(poly, x, y):
+    """
+    Sant för punkterna inom polygonen (jämn-udda-regeln över alla ringar, så
+    hål och flera delar hanteras). Ringarna läses med __geo_interface__, som
+    ger varje ring för sig (se CLAUDE.md).
+    """
+    gi = poly.__geo_interface__
+    parts = gi["coordinates"] if gi["type"] == "MultiPolygon" else [gi["coordinates"]]
+    inside = np.zeros(len(x), bool)
+    for part in parts:
+        for ring in part:
+            r = np.asarray(ring, float)
+            x0, y0, x1, y1 = r[:-1, 0], r[:-1, 1], r[1:, 0], r[1:, 1]
+            for a, b, c, d in zip(x0, y0, x1, y1):
+                cross = (b > y) != (d > y)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    xi = a + (y - b) * (c - a) / (d - b)
+                inside ^= cross & (x < xi)
+    return inside
+
+
 def _tile_index(tiles, x, y):
     """Index för den första rutan som innehåller varje punkt, -1 om ingen."""
     idx = np.full(len(x), -1, np.int64)
@@ -1808,7 +1848,7 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
         steps.next("läser punkter och söker trädtoppar, {} block, {} åt gången".format(
             len(blocks), workers))
         arcpy.SetProgressor("step", "", 0, 100, 1)
-        xs, ys, hs, gs = [], [], [], []
+        xs, ys, hs, gs, hard_l, thin_l = [], [], [], [], [], []
         n_points = n_ground = n_first = n_nohgt = 0
         peak = 0
         done_expected = 0.0
@@ -1855,6 +1895,8 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
                         ys.append(z["y"])
                         hs.append(z["h"])
                         gs.append(z["ground"])
+                        hard_l.append(z["hard"])
+                        thin_l.append(z["thin"])
                     os.remove(res["npz"])
 
                 done_expected += b["expected"]
@@ -1889,6 +1931,15 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
         y = np.concatenate(ys) if ys else np.zeros(0)
         h = np.concatenate(hs) if hs else np.zeros(0)
         g = np.concatenate(gs) if gs else np.zeros(0)
+        hard = np.concatenate(hard_l) if hard_l else np.zeros(0, bool)
+        thin = np.concatenate(thin_l) if thin_l else np.zeros(0, bool)
+        n_hard, n_thin = 0, 0
+        if params["filter"] and len(x):
+            # Räknas bara inom området, som topparna i utdata.
+            inside = _in_polygon(aoi, x, y)
+            n_hard, n_thin = int((hard & inside).sum()), int((thin & inside).sum())
+            keep = ~(hard | thin)
+            x, y, h, g = x[keep], y[keep], h[keep], g[keep]
         tidx = _tile_index(tiles, x, y)
         tmp_fc = _memory_name("toppar")
         temps.append(tmp_fc)
@@ -1916,12 +1967,15 @@ def _run_detect(aoi, files, key, secret, out_fc, params, memory_gb, workers, mes
             arcpy.management.Delete(lyr)
         area_ha = aoi.area / 1e4
         heights = h[np.isfinite(h)]
-        steps.done("{} toppar inom området, {} per ha{}.".format(
+        steps.done("{} toppar inom området, {} per ha{}.{}".format(
             _fmt_count(n_in), _fmt_m(round(n_in / area_ha, 1)) if area_ha > 0 else "?",
             ", trädhöjd median {} m (5-95 %: {}-{} m)".format(
                 _fmt_m(round(float(np.median(heights)), 1)),
                 _fmt_m(round(float(np.percentile(heights, 5)), 1)),
-                _fmt_m(round(float(np.percentile(heights, 95)), 1))) if heights.size else ""))
+                _fmt_m(round(float(np.percentile(heights, 95)), 1))) if heights.size else "",
+            " Borttagna: {} på byggnader och andra hårda ytor, {} på ledningar och andra tunna "
+            "föremål.".format(_fmt_count(n_hard), _fmt_count(n_thin)) if params["filter"] else
+            " Toppar på byggnader och ledningar togs inte bort."))
 
         # ── 5. Metadata ──────────────────────────────────────────────────────
         steps.next("skriver metadata")
@@ -1953,6 +2007,14 @@ def _write_detect_metadata(path, tiles, params, local, n, area_ha):
         ("Sökfönster", "Diameter {} x höjd + {} m, radie 1-6 m i halvmetersteg".format(
             _fmt_m(params["a"]), _fmt_m(params["b"]))),
         ("Lägsta trädhöjd", "{} m".format(_fmt_m(params["hmin"]))),
+        ("Byggnader och ledningar", (
+            "Borttagna: toppar på plana ytor med enkelreturer (minst {} m höga, högst {} m "
+            "ojämnhet, minst {} % enkelreturer, mask utvidgad {} m) och toppar med högst {} "
+            "returer över 2 m som är under {} % av returerna i sökfönstret".format(
+                _fmt_m(_tw.HARD_MIN_H), _fmt_m(_tw.HARD_MAX_ROUGH),
+                int(_tw.HARD_MIN_SINGLE * 100), _fmt_m(_tw.HARD_GROW_M),
+                _tw.THIN_MAX_POINTS, int(_tw.THIN_MAX_COVER * 100))
+            if params["filter"] else "Inte borttagna")),
         ("Toppens läge", "Högsta förstareturen inom {} m från toppen i den utjämnade "
                          "modellen".format(_fmt_m(_tw.APEX_RADIUS))),
         ("Antal toppar", "{} ({} per ha)".format(_fmt_count(n), _fmt_m(round(n / area_ha, 1))

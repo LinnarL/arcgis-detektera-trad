@@ -3,7 +3,7 @@
 Test av DetekteraTrad.pyt genom geobehandlingsramverket (arcpy.ImportToolbox).
 
 Kör med ArcGIS Pro:s Python, utanför Pro:
-    "C:\\Program Files\\ArcGIS\\Pro\\bin\\Python\\envs\\arcgispro-py3\\python.exe" test_detektera_trad.py <fil.las>
+    "C:\\Program Files\\ArcGIS\\Pro\\bin\\Python\\envs\\arcgispro-py3\\python.exe" test_detektera_trad.py <fil.las> ["<bebyggd.las>;xmin ymin xmax ymax"]
 eller i Pro:s Python-fönster:
     import sys; sys.argv = ["", r"<fil.las>"]; exec(open(r"<sökväg>\\test_detektera_trad.py", encoding="utf-8").read())
 
@@ -30,7 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PYT = os.path.join(HERE, "DetekteraTrad.pyt")
 
 
-def main(las):
+def main(las, urban=None):
     work = tempfile.mkdtemp(prefix="trad_test_")
     gdb = arcpy.management.CreateFileGDB(work, "test.gdb")[0]
     arcpy.env.overwriteOutput = True
@@ -59,13 +59,28 @@ def main(las):
 
     out2 = os.path.join(gdb, "toppar2")
     tb.DetekteraTrad("Utbredning (kartvy, lager eller koordinater)", None, ext,
-                     "Lokala LAS/LAZ-filer", las, out2, 4, 1.0, 0.1, 3, None, None, 2, 2)
+                     "Lokala LAS/LAZ-filer", las, out2, 4, 1.0, 0.1, 3, True, None, None, 2, 2)
     n2 = int(arcpy.management.GetCount(out2)[0])
     print("Toppar, standard:", n1, " utjämning 1 m:", n2)
     assert n1 > 0 and 0 < n2 < n1, "fler toppar med mer utjämning"
     sr = arcpy.Describe(out1).spatialReference
     print("Utdata:", sr.name, [f.name for f in arcpy.ListFields(out1)])
     assert sr.factoryCode == 3006
+
+    if urban:
+        # Bebyggt område (urban = "fil.las;xmin ymin xmax ymax"): med filtret ska
+        # toppar på tak och ledningar försvinna.
+        u_las, u_ext = urban.split(";")
+        n_on = n_off = 0
+        for flag, name in ((True, "stad_med"), (False, "stad_utan")):
+            r = tb.DetekteraTrad("Utbredning (kartvy, lager eller koordinater)", None, u_ext,
+                                 "Lokala LAS/LAZ-filer", u_las, os.path.join(gdb, name),
+                                 None, None, None, None, flag)
+            n = int(arcpy.management.GetCount(os.path.join(gdb, name))[0])
+            print(name, n, [m for m in r.getMessages().splitlines() if "Borttagna" in m or
+                             "togs inte bort" in m])
+            n_on, n_off = (n, n_off) if flag else (n_on, n)
+        assert n_on < n_off, "filtret ska ta bort toppar i bebyggt område"
 
     # Syntetiska referensträd i en provyta (100 x 100 m mitt i området).
     plots = arcpy.management.CreateFeatureclass(gdb, "provytor", "POLYGON",
@@ -125,4 +140,4 @@ def main(las):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
