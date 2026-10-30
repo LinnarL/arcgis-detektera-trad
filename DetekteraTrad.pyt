@@ -178,6 +178,13 @@ EVAL_SUMMARY = (
     "detekterade träd som är riktiga), F1, stamantal per ha och lägesfel."
 )
 
+# Nyckeln kan sparas i Windows Autentiseringshanteraren. Samma post används av alla
+# verktyg med Lantmäteriets nyckel, så namnen ska vara lika i verktygslådorna.
+CREDENTIAL_SERVICE = "Lantmateriet API (ArcGIS-verktyg)"
+CREDENTIAL_USER = "consumer"
+LOGIN_NO_KEY = "Ange en consumer key från Lantmäteriets API-portal."
+LOGIN_NO_SECRET = "Ange consumer secret."
+
 # Verktygstips per parameter, visas i verktygsdialogen. Se _write_tool_metadata.
 TOOLTIPS_DETECT = {
     "aoi_mode": (
@@ -268,7 +275,14 @@ TOOLTIPS_DETECT = {
     ),
     "consumer_secret": (
         "Consumer secret som hör till nyckeln. Visas dold i dialogen och skrivs aldrig till "
-        "meddelandena."
+        "meddelandena. Kan lämnas tomt om nyckeln är sparad."
+    ),
+    "save_login": (
+        "Spara consumer key och secret i Windows Autentiseringshanteraren när körningen startar, "
+        "krypterat för ditt Windows-konto och bara på den här datorn. Nyckeln sparas bara om "
+        "Lantmäteriet godkänner den. Sedan fylls consumer key i av sig själv och secret kan "
+        "lämnas tomt, i alla verktyg som använder Lantmäteriets nyckel. Fyll i och markera igen "
+        "för att byta nyckel. Ta bort den under Autentiseringshanteraren, Windows-autentiseringsuppgifter."
     ),
     "memory_gb": (
         "Ungefär hur mycket arbetsminne verktyget får använda utöver ArcGIS Pro självt. "
@@ -430,6 +444,54 @@ def _get_token(key, secret):
             )
         raise
     return json.loads(body.decode("utf-8"))["access_token"]
+
+
+def _saved_login():
+    """(key, secret) sparade i Windows Autentiseringshanteraren, annars tomma."""
+    try:
+        import keyring
+        raw = keyring.get_password(CREDENTIAL_SERVICE, CREDENTIAL_USER)
+        saved = json.loads(raw) if raw else {}
+    except Exception:
+        saved = {}
+    return saved.get("key", ""), saved.get("secret", "")
+
+
+def _login(p):
+    """
+    Key och secret: det som står i fälten, annars det sparade. Varje värde för
+    sig, så att en ny secret fungerar även om Pro har tömt fältet för key.
+    """
+    saved_key, saved_secret = _saved_login()
+    key = (p["consumer_key"].valueAsText or "").strip() or saved_key
+    secret = (p["consumer_secret"].valueAsText or "").strip() or saved_secret
+    if not key:
+        raise ValueError(LOGIN_NO_KEY)
+    if not secret:
+        raise ValueError(LOGIN_NO_SECRET)
+    return key, secret
+
+
+def _check_login_fields(p):
+    """Felmeddelanden i dialogen för det som varken är ifyllt eller sparat."""
+    saved_key, saved_secret = _saved_login()
+    if not (p["consumer_key"].valueAsText or "").strip() and not saved_key:
+        p["consumer_key"].setErrorMessage(LOGIN_NO_KEY)
+    if not (p["consumer_secret"].valueAsText or "").strip() and not saved_secret:
+        p["consumer_secret"].setErrorMessage(LOGIN_NO_SECRET)
+
+
+def _remember_login(key, secret, messages):
+    """Spara nyckeln, men bara om Lantmäteriet godkänner den (annars ValueError)."""
+    _get_token(key, secret)
+    try:
+        import keyring
+        keyring.set_password(CREDENTIAL_SERVICE, CREDENTIAL_USER,
+                             json.dumps({"key": key, "secret": secret}))
+    except Exception as exc:
+        messages.addWarningMessage("Nyckeln kunde inte sparas: {}".format(exc))
+    else:
+        messages.addMessage("Nyckeln är sparad i Windows Autentiseringshanteraren.")
 
 
 def _check_access(url, token):
@@ -1485,10 +1547,17 @@ class DetekteraTrad:
             displayName="Consumer key", name="consumer_key", datatype="GPString",
             parameterType="Optional", direction="Input", category="Inloggning",
         )
+        p_key.value = _saved_login()[0] or None
         p_secret = arcpy.Parameter(
             displayName="Consumer secret", name="consumer_secret", datatype="GPStringHidden",
             parameterType="Optional", direction="Input", category="Inloggning",
         )
+
+        p_save = arcpy.Parameter(
+            displayName="Spara nyckeln på den här datorn", name="save_login", datatype="GPBoolean",
+            parameterType="Optional", direction="Input", category="Inloggning",
+        )
+        p_save.value = False
 
         p_mem = arcpy.Parameter(
             displayName="Minnesbudget (GB)", name="memory_gb", datatype="GPDouble",
@@ -1502,7 +1571,7 @@ class DetekteraTrad:
         p_workers.filter.list = [1, 32]
 
         return [p_mode, p_aoi, p_extent, p_source, p_files, p_out, p_crowns, p_min, p_sigma,
-                p_a, p_b, p_filter, p_key, p_secret, p_mem, p_workers]
+                p_a, p_b, p_filter, p_key, p_secret, p_mem, p_workers, p_save]
 
     def isLicensed(self):
         return True
@@ -1516,6 +1585,7 @@ class DetekteraTrad:
         p["las_files"].enabled = local
         p["consumer_key"].enabled = not local
         p["consumer_secret"].enabled = not local
+        p["save_login"].enabled = not local
 
     def updateMessages(self, parameters):
         p = {q.name: q for q in parameters}
@@ -1534,11 +1604,7 @@ class DetekteraTrad:
             if not p["las_files"].valueAsText:
                 p["las_files"].setErrorMessage("Välj minst en LAS- eller LAZ-fil.")
         else:
-            if not (p["consumer_key"].valueAsText or "").strip():
-                p["consumer_key"].setErrorMessage(
-                    "Ange en consumer key från Lantmäteriets API-portal.")
-            if not (p["consumer_secret"].valueAsText or "").strip():
-                p["consumer_secret"].setErrorMessage("Ange consumer secret.")
+            _check_login_fields(p)
 
         mh = p["min_height"].value
         if mh is not None and not (0 <= mh <= 50):
@@ -1593,10 +1659,15 @@ class DetekteraTrad:
                 "b": DEFAULT_WIN_B if p["win_b"].value is None else float(p["win_b"].value),
                 "filter": p["filter_objects"].value is not False,
             }
+            key, secret = "", ""
+            if p["source"].valueAsText != SRC_LOCAL:
+                key, secret = _login(p)
+                if p["save_login"].value:
+                    _remember_login(key, secret, messages)
             _run_detect(
                 aoi, files,
-                (p["consumer_key"].valueAsText or "").strip(),
-                (p["consumer_secret"].valueAsText or "").strip(),
+                key,
+                secret,
                 p["out_features"].valueAsText, params,
                 p["memory_gb"].value or None, p["workers"].value or None, messages,
                 out_crowns=p["out_crowns"].valueAsText or None,

@@ -50,6 +50,7 @@ before relying on counts.
 | Sökfönster, A and B | 0.1 and 3 | Under Detektering. A cell is a top if it is highest within a circle of diameter A x height + B metres |
 | Ta bort toppar på byggnader och ledningar | on | Under Detektering. See "Buildings and power lines" below |
 | Consumer key / secret | - | Under Inloggning. Only for Lantmäteriet data |
+| Spara nyckeln på den här datorn | off | Under Inloggning. Saves the key and secret in Windows Credential Manager, once Lantmäteriet has accepted them. After that both fields can stay empty, and the same entry is used by all toolboxes here that take this key. To remove it: Credential Manager, Windows Credentials |
 | Minnesbudget (GB) / Block samtidigt | automatic | Under Avancerat. Same scheme as the Laserdata toolboxes |
 
 Tree top fields: `TRAD_ID`, `TRADHOJD` (tree height, m above ground), `MARKHOJD` (ground elevation
